@@ -18,12 +18,21 @@
     <ClCompile Include="..\..\code\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\code\LuaServerApplication.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\code\StaticFileServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\code\SignalHandler.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\code\HelloWorldRequestHandler.hpp">
+    <ClInclude Include="..\..\code\LuaServerApplication.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\code\StaticFileServer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
