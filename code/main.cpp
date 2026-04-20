@@ -7,6 +7,7 @@
 #include <NetworkSetup.hpp>
 #include "SignalHandler.hpp"
 #include "StaticFileServer.hpp"
+#include "LuaServerApplication.hpp"
 
 using namespace argb;
 
@@ -17,10 +18,12 @@ int main (int , const char * [])
         NetworkSetup network_setup;
         HttpServer   server;
         Port         port{ 80 };
+        
+        LuaServerApplication lua_server_app    ("../../examples/lua-server/main.lua");
+        StaticFileServer     static_file_server("../../examples/static-website", "/");
 
-        StaticFileServer static_file_server("../../examples/static-website");
-
-        server.register_handler_factory ("/", static_file_server);
+        server.register_handler_factory (lua_server_app);
+        server.register_handler_factory (static_file_server);
 
         std::cout << "Running HTTP server on port " << static_cast<uint16_t>(port) << "..." << std::endl;
 
