@@ -2,11 +2,89 @@
 /// @copyright Copyright (c) 2026 Ángel, All rights reserved.
 /// angel.rodriguez@udit.es
 
+#include <iostream>
 #include "LuaServerApplication.hpp"
 
 namespace argb
 {
 
+    namespace
+    {
+
+        Sqlite::Value make_sqlite_argument_from_lua (lua::Value argument, int argument_index)
+        {
+            if (argument.is<lua::Nil    > ()) return nullptr;
+            if (argument.is<lua::Boolean> ()) return argument.to<bool> ();
+            if (argument.is<lua::Number > ()) return argument.to<double> ();
+            if (argument.is<lua::String > ()) return argument.to<std::string> ();
+
+            throw std::invalid_argument
+            (
+                "Invalid argument type for query at position " + std::to_string (argument_index) + ". Supported types are: nil, boolean, number, string."
+            );
+        }
+
+        std::vector<Sqlite::Value> collect_lua_arguments_for_sqlite (const lua::Value & arguments)
+        {
+            if (arguments.is<lua::Nil> ())
+            {
+                return {};
+            }
+
+            if (not arguments.is<lua::Table> ())
+            {
+                throw std::invalid_argument("Parameter 'arguments' must be an array-like table or nil.");
+            }
+
+            std::map<int, Sqlite::Value> argument_values;
+
+            int max_argument_index = 0;
+
+            arguments.for_each_in_table
+            (
+                [&] (lua::Value key, lua::Value value)
+                {
+                    if (not key.is<lua::Integer> ())
+                    {
+                        throw std::invalid_argument("Parameter 'arguments' must use only positive integer keys.");
+                    }
+
+                    int argument_index = key.to<int> ();
+
+                    if (argument_index <= 0)
+                    {
+                        throw std::invalid_argument("Parameter 'arguments' must use only positive integer keys.");
+                    }
+
+                    if (argument_index > max_argument_index)
+                    {
+                        max_argument_index = argument_index;
+                    }
+
+                    argument_values.insert_or_assign
+                    (
+                        argument_index,
+                        make_sqlite_argument_from_lua (value, argument_index)
+                    );
+                }
+            );
+
+            std::vector<Sqlite::Value> result(max_argument_index, nullptr);
+
+            for (auto & [argument_index, argument_value] : argument_values)
+            {
+                result[argument_index - 1] = std::move (argument_value);
+            }
+
+            return result;
+        }
+
+    }
+
+    // TO DO: we create request and response tables which store native object pointers.
+    // If Lua code keeps references to these tables after the request is processed, it will be able to access the
+    // native objects after they are destroyed, which is undefined behavior. We should find a way to prevent this,
+    // for example by making the tables invalid after the request is processed or by using a different mechanism.
     bool LuaServerApplication::RequestHandler::process (const HttpRequest & request, HttpResponse & response)
     {
         try
@@ -14,30 +92,44 @@ namespace argb
             HttpResponse::Serializer        response_serializer(response);
             LuaHttpResponseSerializerBridge response_bridge    (response_serializer);
 
-            auto request_table  = server.virtual_machine.newTable ();
+            auto  request_table = server.virtual_machine.newTable ();
             auto response_table = server.virtual_machine.newTable ();
 
-            request_table .set ("__native_object_pointer", static_cast<lua::Pointer>(const_cast<HttpRequest *>(&request)));
+             request_table.set ("__native_object_type",    native_object_type_name<HttpRequest> ());
+             request_table.set ("__native_object_pointer", static_cast<lua::Pointer>(const_cast<HttpRequest *>(&request)));
+            response_table.set ("__native_object_type",    native_object_type_name<LuaHttpResponseSerializerBridge> ());
             response_table.set ("__native_object_pointer", static_cast<lua::Pointer>(&response_bridge));
 
-            server.virtual_machine["setmetatable"]
+            request_table = server.virtual_machine["setmetatable"].call
             (
                 request_table,
                 server.virtual_machine["__http_request_metatable"]
             );
 
-            server.virtual_machine["setmetatable"]
+            response_table = server.virtual_machine["setmetatable"].call
             (
                 response_table,
                 server.virtual_machine["__http_response_metatable"]
             );
 
             endpoint.unref ().call (request_table, response_table);
+
+            return true;
         }
-        catch (const lua::RuntimeError & )
+        catch (const lua::RuntimeError & error)
         {
-            send_plain_text_response (response, 500, "Internal Server Error");
+            std::cout << "Lua runtime error: " << error.what () << std::endl;
         }
+        catch (const std::exception & exception)
+        {
+            std::cout << "Standard exception: " << exception.what () << std::endl;
+        }
+        catch (...)
+        {
+            std::cout << "Unknown exception was caught at LuaServerApplication::RequestHandler::process()." << std::endl;
+        }
+
+        send_plain_text_response (response, 500, "Internal Server Error");
 
         return true;
     }
@@ -92,6 +184,34 @@ namespace argb
         return {};
     }
 
+    void LuaServerApplication::route (const std::string & method_string, const std::string & path, lua::Value endpoint)
+    {
+        if (path.empty () || path.front () != '/')
+        {
+            throw std::invalid_argument("Parameter 'path' must be a non-empty string starting with '/'.");
+        }
+
+        if (not endpoint.is<lua::Callable> ())
+        {
+            throw std::invalid_argument("Parameter 'endpoint' must be a Lua function.");
+        }
+
+        auto method = HttpRequest::Parser::method_from_string (method_string);
+
+        if (method == HttpRequest::Method::UNDEFINED)
+        {
+            throw std::invalid_argument("Invalid HTTP method: " + method_string + ".");
+        }
+
+        auto & endpoints_by_path = endpoints[static_cast<size_t>(method)];
+
+        // Keys ending with '/' act as prefix routes (e.g. "/users/" matches "/users/1").
+        // Keys without a trailing '/' match exactly or as a path-segment prefix.
+        // Both forms are kept as-is so they coexist as distinct entries in the map.
+
+        endpoints_by_path.insert_or_assign (std::string(path), std::move (endpoint));
+    }
+
     void LuaServerApplication::create_lua_bridge ()
     {
         create_bridge_for_server        ();
@@ -107,19 +227,12 @@ namespace argb
         server_bridge.set
         (
             "route",
-            [this](lua::Value method_value, lua::Value path_value, lua::Value endpoint_value)
+            [this] (lua::Value method_value, lua::Value path_value, lua::Value endpoint_value)
             {
-                if (not method_value.is<lua::String>())
-                {
-                    virtual_machine.error ("Parameter 'method' must be a string.");
-                }
+                if (not method_value.is<lua::String> ()) throw std::invalid_argument("Parameter 'method' must be a string.");
+                if (not   path_value.is<lua::String> ()) throw std::invalid_argument("Parameter 'path' must be a string.");
 
-                if (not path_value.is<lua::String>())
-                {
-                    virtual_machine.error ("Parameter 'path' must be a string.");
-                }
-
-                bridge_server_route (method_value.toString (), path_value.toString (), endpoint_value);
+                route (method_value.toString (), path_value.toString (), endpoint_value);
             }
         );
 
@@ -130,13 +243,13 @@ namespace argb
     {
         auto http_request_bridge = virtual_machine.newTable ();
 
-        create_method_bridge (http_request_bridge, "get_protocol", &HttpRequest::get_protocol);
-        create_method_bridge (http_request_bridge, "get_method",   &HttpRequest::get_method  );
-        create_method_bridge (http_request_bridge, "get_path",     &HttpRequest::get_path    );
-        create_method_bridge (http_request_bridge, "get_fragment", &HttpRequest::get_fragment);
-        create_method_bridge (http_request_bridge, "get_header",   &HttpRequest::get_header  );
-        create_method_bridge (http_request_bridge, "get_query",    &HttpRequest::get_query   );
-        create_method_bridge (http_request_bridge, "get_body",     &HttpRequest::get_body    );
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_protocol", &HttpRequest::get_protocol);
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_method",   &HttpRequest::get_method  );
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_path",     &HttpRequest::get_path    );
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_fragment", &HttpRequest::get_fragment);
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_header",   &HttpMessage::get_header  );
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_query",    &HttpRequest::get_query   );
+        create_method_bridge<HttpRequest> (http_request_bridge, "get_body",     &HttpMessage::get_body    );
 
         auto http_request_metatable = virtual_machine.newTable ();
 
@@ -148,7 +261,7 @@ namespace argb
             "__newindex",
             [this](lua::Value, lua::Value, lua::Value)
             {
-                virtual_machine.error("HTTP request is read-only.");
+                throw std::runtime_error("HTTP request is read-only.");
             }
         );
 
@@ -159,10 +272,10 @@ namespace argb
     {
         auto http_response_bridge = virtual_machine.newTable ();
 
-        create_method_bridge (http_response_bridge, "status",     &LuaHttpResponseSerializerBridge::status    );
-        create_method_bridge (http_response_bridge, "header",     &LuaHttpResponseSerializerBridge::header    );
-        create_method_bridge (http_response_bridge, "end_header", &LuaHttpResponseSerializerBridge::end_header);
-        create_method_bridge (http_response_bridge, "body",       &LuaHttpResponseSerializerBridge::body      );
+        create_method_bridge<LuaHttpResponseSerializerBridge> (http_response_bridge, "status",     &LuaHttpResponseSerializerBridge::status    );
+        create_method_bridge<LuaHttpResponseSerializerBridge> (http_response_bridge, "header",     &LuaHttpResponseSerializerBridge::header    );
+        create_method_bridge<LuaHttpResponseSerializerBridge> (http_response_bridge, "end_header", &LuaHttpResponseSerializerBridge::end_header);
+        create_method_bridge<LuaHttpResponseSerializerBridge> (http_response_bridge, "body",       &LuaHttpResponseSerializerBridge::body      );
 
         auto http_response_metatable = virtual_machine.newTable ();
 
@@ -174,58 +287,11 @@ namespace argb
             "__newindex",
             [this] (lua::Value, lua::Value, lua::Value)
             {
-                virtual_machine.error ("HTTP response fields cannot be assigned directly.");
+                throw std::runtime_error("HTTP response fields cannot be assigned directly.");
             }
         );
 
         virtual_machine.set ("__http_response_metatable", http_response_metatable);
-    }
-
-    void LuaServerApplication::bridge_server_route (const std::string & method_string, const std::string & path, lua::Value endpoint)
-    {
-        if (path.empty () || path.front () != '/')
-        {
-            virtual_machine.error ("Parameter 'path' must be a non-empty string starting with '/'.");
-        }
-
-        if (not endpoint.is<lua::Callable> ())
-        {
-            virtual_machine.error ("Parameter 'endpoint' must be a Lua function.");
-        }
-
-        auto method = HttpRequest::Parser::method_from_string (method_string);
-
-        if (method == HttpRequest::Method::UNDEFINED)
-        {
-            virtual_machine.error ("Invalid HTTP method: %s.", method_string.c_str ());
-        }
-
-        auto & endpoints_by_path = endpoints[static_cast<size_t>(method)];
-
-        // Keys ending with '/' act as prefix routes (e.g. "/users/" matches "/users/1").
-        // Keys without a trailing '/' match exactly or as a path-segment prefix.
-        // Both forms are kept as-is so they coexist as distinct entries in the map.
-
-        endpoints_by_path.insert_or_assign (std::string(path), std::move(endpoint));
-    }
-
-    static std::vector<Sqlite::SqlValue> collect_sql_args (lua::Value & args)
-    {
-        std::vector<Sqlite::SqlValue> result;
-
-        if (args.is<lua::Table> ())
-        {
-            for (int i = 1; ; ++i)
-            {
-                lua::Value arg = args[i];
-
-                if      (arg.is<lua::Number> ()) result.emplace_back (arg.to<double>     ());
-                else if (arg.is<lua::String> ()) result.emplace_back (arg.to<std::string>());
-                else break;
-            }
-        }
-
-        return result;
     }
 
     void LuaServerApplication::create_bridge_for_sqlite ()
@@ -235,28 +301,50 @@ namespace argb
         db_table.set
         (
             "execute",
-            [this] (std::string sql, lua::Value args)
+            [this] (std::string sql_code, lua::Value lua_arguments)
             {
-                auto bind_args = collect_sql_args (args);
+                try
+                {
+                    auto sqlite_arguments = collect_lua_arguments_for_sqlite (lua_arguments);
 
-                database ().execute_all (sql, bind_args);
+                    database ().execute (sql_code, std::span<const Sqlite::Value> (sqlite_arguments));
+                }
+                catch (const std::exception & exception)
+                {
+                    throw std::runtime_error(std::string("Database error: ") + exception.what ());
+                }
             }
         );
 
         db_table.set
         (
             "query",
-            [this] (std::string sql, lua::Value args) -> lua::Value
+            [this] (std::string sql_code, lua::Value lua_arguments) -> lua::Value
             {
-                auto bind_args = collect_sql_args (args);
+                try
+                {
+                    auto sqlite_arguments = collect_lua_arguments_for_sqlite (lua_arguments);
 
-                return make_sqlite_row_table (database ().query_all (sql, bind_args));
+                    return make_sqlite_row_table (database ().query (sql_code, std::span<const Sqlite::Value> (sqlite_arguments)));
+                }
+                catch (const std::exception & exception)
+                {
+                    throw std::runtime_error(std::string("Database error: ") + exception.what ());
+                }
             }
         );
 
-        virtual_machine.set ("db", db_table);
+        virtual_machine.set ("database", db_table);
     }
 
+    // TO DO: we create a Lua table which stores a native object pointer to the Row object and we store the Row object
+    // in a map in the LuaServerApplication instance. When Lua GC collects the table, we remove the corresponding Row
+    // object from the map. This way we ensure that the Row object is kept alive as long as Lua can access it and it is
+    // destroyed when Lua can no longer access it.
+    // However, this approach has some limitations. The Row lifetime is tied to the Lua table, so if Lua code keeps
+    // references to the table after the query is processed, it will keep the Row object alive and prevent it from being
+    // finalized. We should find a way to prevent this, for example by making the table invalid after the query is
+    // processed or by using a different mechanism.
     lua::Value LuaServerApplication::make_sqlite_row_table (Sqlite::Row row)
     {
         auto  bridge     = std::make_unique<LuaSqliteRowBridge> (std::move (row));
@@ -266,6 +354,7 @@ namespace argb
 
         auto row_table = virtual_machine.newTable ();
 
+        row_table.set ("__native_object_type",    native_object_type_name<LuaSqliteRowBridge> ());
         row_table.set ("__native_object_pointer", static_cast<lua::Pointer>(bridge_ptr));
 
         // Plant a sentinel lambda inside the row table. When Lua GCs the row table, this functor
@@ -280,28 +369,30 @@ namespace argb
 
         row_table.set ("__gc_sentinel", [gc_hook] () {});
 
-        auto row_method_table = virtual_machine.newTable ();
+        {
+            auto row_method_table = virtual_machine.newTable ();
 
-        create_method_bridge (row_method_table, "advance",     &LuaSqliteRowBridge::advance    );
-        create_method_bridge (row_method_table, "get_integer", &LuaSqliteRowBridge::get_integer);
-        create_method_bridge (row_method_table, "get_string",  &LuaSqliteRowBridge::get_string );
-        create_method_bridge (row_method_table, "get_real",    &LuaSqliteRowBridge::get_real   );
+            create_method_bridge<LuaSqliteRowBridge> (row_method_table, "advance",     &LuaSqliteRowBridge::advance    );
+            create_method_bridge<LuaSqliteRowBridge> (row_method_table, "get_integer", &LuaSqliteRowBridge::get_integer);
+            create_method_bridge<LuaSqliteRowBridge> (row_method_table, "get_string",  &LuaSqliteRowBridge::get_string );
+            create_method_bridge<LuaSqliteRowBridge> (row_method_table, "get_real",    &LuaSqliteRowBridge::get_real   );
 
-        auto row_metatable = virtual_machine.newTable ();
+            auto row_metatable = virtual_machine.newTable ();
 
-        row_metatable.set ("__index",     row_method_table);
-        row_metatable.set ("__metatable", "protected"     );
+            row_metatable.set ("__index",      row_method_table);
+            row_metatable.set ("__metatable", "protected"      );
 
-        row_metatable.set
-        (
-            "__newindex",
-            [this] (lua::Value, lua::Value, lua::Value)
-            {
-                virtual_machine.error ("Row fields cannot be assigned directly.");
-            }
-        );
+            row_metatable.set
+            (
+                "__newindex",
+                [this] (lua::Value, lua::Value, lua::Value)
+                {
+                    throw std::runtime_error("Row fields cannot be assigned directly.");
+                }
+            );
 
-        virtual_machine["setmetatable"] (row_table, row_metatable);
+            row_table = virtual_machine["setmetatable"].call (row_table, row_metatable);
+        }
 
         return row_table;
     }

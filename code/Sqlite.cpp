@@ -139,6 +139,50 @@ namespace argb
         }
     }
 
+    void Sqlite::execute (string_view sql_code, std::span<const Value> arguments)
+    {
+        Statement * statement = prepare (sql_code);
+
+        if (statement == nullptr)
+        {
+            throw_runtime_error ("Error preparing SQL statement for execution: ");
+        }
+
+        Row row(statement);
+
+        int index = 1;
+
+        for (const Value & argument : arguments)
+        {
+            std::visit ([&] (const auto & value) { bind (statement, index++, value); }, argument);
+        }
+
+        while (row.advance ())
+        {
+        }
+    }
+
+    Sqlite::Row Sqlite::query (string_view sql_code, std::span<const Value> arguments)
+    {
+        Statement * statement = prepare (sql_code);
+
+        if (statement == nullptr)
+        {
+            throw_runtime_error ("Error preparing SQL statement for query: ");
+        }
+
+        Row row(statement);
+
+        int index = 1;
+
+        for (const Value & argument : arguments)
+        {
+            std::visit ([&] (const auto & value) { bind (statement, index++, value); }, argument);
+        }
+
+        return row;
+    }
+
     Sqlite::Statement * Sqlite::prepare (string_view sql_code)
     {
         Statement * statement = nullptr;
@@ -149,6 +193,14 @@ namespace argb
         }
 
         return statement;
+    }
+
+    void Sqlite::bind (Statement * statement, int index, std::nullptr_t )
+    {
+        if (sqlite3_bind_null (statement, index) != SQLITE_OK)
+        {
+            throw_runtime_error ("Error binding a null value: ");
+        }
     }
 
     void Sqlite::bind (Statement * statement, int index, bool value)
@@ -197,50 +249,6 @@ namespace argb
         {
             throw_runtime_error ("Error binding a string value: ");
         }
-    }
-
-    void Sqlite::execute_all (string_view sql_code, std::span<const SqlValue> args)
-    {
-        Statement * statement = prepare (sql_code);
-
-        if (statement == nullptr)
-        {
-            throw_runtime_error ("Error preparing SQL statement for execution: ");
-        }
-
-        Row row(statement);
-
-        int index = 1;
-
-        for (const SqlValue & arg : args)
-        {
-            std::visit ([&] (const auto & value) { bind (statement, index++, value); }, arg);
-        }
-
-        while (row.advance ())
-        {
-        }
-    }
-
-    Sqlite::Row Sqlite::query_all (string_view sql_code, std::span<const SqlValue> args)
-    {
-        Statement * statement = prepare (sql_code);
-
-        if (statement == nullptr)
-        {
-            throw_runtime_error ("Error preparing SQL statement for query: ");
-        }
-
-        Row row(statement);
-
-        int index = 1;
-
-        for (const SqlValue & arg : args)
-        {
-            std::visit ([&] (const auto & value) { bind (statement, index++, value); }, arg);
-        }
-
-        return row;
     }
 
     void Sqlite::throw_runtime_error (const char * message, Database * database)
